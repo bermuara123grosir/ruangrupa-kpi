@@ -53,7 +53,8 @@
   };
   var BELUM = ['Live Shopee (rolling, 4 jam/sesi)', 'Request divisi & event', 'Brief tambahan dari Mas', 'Laporan data akun (Hakim)', 'Laporan mingguan toko (Ega)', 'Meeting tim'];
   function jenisJam(j) { return j.vol.reduce(function (a, v) { return a + v[1]; }, 0) * (j.flat ? 1 : j.per); }
-  var EGA_SUB = { Disiplin: ['Konten AI Kesatrian', 'Rekap realtime', 'Laporan tepat Sabtu'], Hasil: ['Optimasi & omset', 'Kesehatan toko', 'Iklan Shopee'] };
+  var ABS_K = ['Absensi tepat waktu', 'Jam kerja terpenuhi']; // KPI kehadiran (bobot 3 + 3; di Ega masuk rincian Disiplin)
+  var EGA_SUB = { Disiplin: ['Konten AI Kesatrian', 'Rekap realtime', 'Laporan tepat Sabtu', 'Absensi tepat waktu', 'Jam kerja terpenuhi'], Hasil: ['Optimasi & omset', 'Kesehatan toko', 'Iklan Shopee'] };
   var GP = window.__PARAMS__ || null; // diisi Apps Script (doGet) saat jalan sebagai web app
   var GAS = !!(GP && window.google && google.script && google.script.run);
   var qs = new URLSearchParams(GP ? GP.query || '' : location.search);
@@ -90,7 +91,8 @@
 
   /* ---------- model ---------- */
   function build(rows) {
-    var m = { meta: null, orang: {}, kpi: [], uang: [], ads: [], cek: [], item: [], todo: {}, todoMeta: null, todoErr: null };
+    var m = { meta: null, orang: {}, kpi: [], uang: [], ads: [], cek: [], item: [], todo: {}, todoMeta: null, todoErr: null, abs: null };
+    var A = function () { return m.abs || (m.abs = { meta: {}, rows: [], rekap: [], jam: {} }); };
     rows.forEach(function (r) {
       var t = r[0];
       if (t === 'meta') m.meta = { bulan: r[1], bulanIso: r[2], mg: num(r[3]) || 1, nw: num(r[4]) || 5, updated: r[5], mulai: r[6], w1: r[7], today: r[8], labels: r.slice(9, 15), curWeek: num(r[15]) || 1, akhir: r[16], roas: r[17] || '' };
@@ -102,6 +104,10 @@
       else if (t === 'todo' && r[1]) m.todo[r[1]] = { done: num(r[2]) || 0, qty: num(r[3]) || 0 };
       else if (t === 'todo_meta') m.todoMeta = r[1] || '';
       else if (t === 'todo_err') m.todoErr = r[1] || 'tidak terbaca';
+      else if (t === 'abs_meta') A().meta = { suf: r[1], bulan: r[2], w1: r[3], nw: num(r[4]) || 5, cutoff: r[5], efektif: num(r[6]) || 8, tol: num(r[7]) == null ? 10 : num(r[7]) };
+      else if (t === 'jamresmi' && r[1]) A().jam[r[1]] = { masuk: r[2], pulang: r[3], cat: r[4] || '' };
+      else if (t === 'abs' && r[1] && r[2]) A().rows.push({ date: r[1], nama: r[2], masuk: r[3] || '', pulang: r[4] || '', ket: r[5] || '', status: r[6] || '', wajib: r[7] || '', jam: r[8] || '', cukup: r[9] || '' });
+      else if (t === 'rekap' && r[1]) A().rekap.push({ nama: r[1], per: r[2], mulai: r[3], selesai: r[4], hari: num(r[5]), jw: num(r[6]), ja: num(r[7]), sel: num(r[8]), pct: num(r[9]), telat: num(r[10]), kurang: num(r[11]) });
       else if (t === 'item' && r[1]) m.item.push({ nama: r[1], kpi: r[2], date: r[3], wk: num(r[4]), nilai: num(r[5]), pembagi: num(r[6]), ket: r[7], sumber: r[8] });
     });
     if (!m.meta) throw new Error('Baris "meta" tidak ada di CSV — pastikan yang dipublikasikan adalah tab 🌐 Web.');
@@ -139,6 +145,11 @@
     if (k.nama === 'Ega' && EGA_SUB[k.kpi]) {
       var parts = EGA_SUB[k.kpi].map(function (s) { var kk = D.kpi.filter(function (x) { return x.nama === 'Ega' && x.kpi === s; })[0]; var c = kk ? capOf(kk) : null; return c == null ? null : s + ' ' + pct(c); }).filter(Boolean);
       return parts.length ? parts.join(' · ') : 'Belum ada data';
+    }
+    if (ABS_K.indexOf(k.kpi) >= 0 && D.abs) {
+      var st = absStat(k.nama);
+      if (!st.hari) return 'Belum ada data';
+      return k.kpi === ABS_K[0] ? st.tepat + ' / ' + st.hari + ' hari tepat waktu' : nfmt(st.ja) + ' / ' + nfmt(st.jw) + ' jam';
     }
     var a = agg(k.nama, k.kpi);
     if (!a) return 'Belum ada data';
@@ -239,6 +250,87 @@
       '<div class="legend"><span><i style="background:#d9d2c7"></i>Sebelum pembagian reels</span><span><i style="background:#154736"></i>Dipakai (setelah pembagian reels real/AI)</span></div>' +
       '<ul class="jam">' + rows + '</ul><p class="note">Total ≈' + tot + ' jam/minggu. Perkiraan kasar: belum termasuk live Shopee, request event, brief tambahan dari Mas, dan akun Ruang Rupa (mulai Des: reels Edu, brief + upload Yudhis).</p></div>';
   }
+  /* ---------- absensi & jam kerja ---------- */
+  function hm(t) { var m = /^(\d{1,2})[:.](\d{2})/.exec(t || ''); return m ? +m[1] * 60 + +m[2] : null; }
+  function absPer() { return S.mode === 'bulan' ? 'Bulan' : 'Minggu ' + S.wk; }
+  function absStat(nama) {
+    var A = D.abs, rk = A.rekap.filter(function (r) { return r.nama === nama && r.per === absPer(); })[0];
+    var from = rk ? rk.mulai : '', to = rk ? rk.selesai : '', cut = A.meta.cutoff || '9999';
+    var o = { tepat: 0, telat: 0, telatMnt: 0, izin: 0, sakit: 0, cuti: 0, alpa: 0, kosong: 0, hari: 0, jw: rk ? rk.jw : null, ja: rk ? rk.ja : null, pct: rk ? rk.pct : null, kurang: rk ? rk.kurang : 0, rows: [] };
+    A.rows.forEach(function (r) {
+      if (r.nama !== nama || r.date < from || r.date > to || r.date > cut) return;
+      o.rows.push(r);
+      var k = r.ket.toLowerCase();
+      if (k === 'izin' || k === 'sakit' || k === 'cuti') { o[k]++; return; }
+      o.hari++;
+      if (k === 'alpa') { o.alpa++; return; }
+      if (/^tepat/i.test(r.status)) o.tepat++;
+      else if (/^terlambat/i.test(r.status)) { o.telat++; o.telatMnt += +((/(\d+)\s*m/.exec(r.status) || [])[1] || 0); }
+      else o.kosong++;
+    });
+    if (rk && rk.hari != null) o.hari = rk.hari;
+    return o;
+  }
+  function absTag(r) {
+    var k = r.ket.toLowerCase();
+    if (k === 'alpa') return '<span class="tag tag-miss">Alpa</span>';
+    if (k && k !== 'hadir') return '<span class="tag tag-info">' + esc(r.ket) + '</span>';
+    if (/^tepat/i.test(r.status)) return '<span class="tag tag-ok">' + esc(r.status) + '</span>';
+    if (/^terlambat/i.test(r.status)) return '<span class="tag tag-late">' + esc(r.status) + '</span>';
+    return '<span class="tag tag-wait">Belum diisi</span>';
+  }
+  function cukupTag(c) { return !c || c === '—' ? '<span class="muted">—</span>' : /^cukup/i.test(c) ? '<span class="tag tag-ok">' + esc(c) + '</span>' : '<span class="tag tag-late">' + esc(c) + '</span>'; }
+  function pbar(r, col) { return '<div class="pbar"><span style="width:' + (r == null ? 0 : Math.min(100, r * 100)).toFixed(1) + '%;background:' + col + '"></span></div>'; }
+  function absRule() {
+    var m = D.abs.meta, tol = m.tol, ef = m.efektif;
+    return 'Tepat waktu = masuk kurang dari ' + tol + ' menit setelah jam resmi (09:00 → s.d. 09:' + ('0' + (tol - 1)).slice(-2) + ':59); mulai 09:' + ('0' + tol).slice(-2) + ' = Terlambat, menitnya dihitung dari jam resmi. Wajib pulang = yang lebih lambat antara jam pulang resmi dan jam masuk + ' + ef + ' jam, tanpa potongan istirahat. Izin, Sakit, Cuti tidak dihitung; Alpa = 0 jam. Data s.d. ' + ddmm(m.cutoff) + ' (kemarin).';
+  }
+  function absPanel(ps) {
+    var h = '<div class="panel abs-panel"><h2>Absensi & jam kerja</h2>';
+    if (!D.abs) return h + '<div class="att-empty">Absensi belum disambungkan ke data asli — menunggu jam masuk resmi Novri & Yudhis ditetapkan. Lihat contoh tampilannya: <a target="_top" href="' + esc(BASE) + '?demo=1">Buka data contoh</a>.</div></div>';
+    var st = ps.map(function (p) { return { p: p, s: absStat(p.nama) }; });
+    var T = { tepat: 0, hari: 0, ja: 0, jw: 0, telat: 0, alpa: 0, isc: 0 };
+    st.forEach(function (x) { T.tepat += x.s.tepat; T.hari += x.s.hari; T.ja += x.s.ja || 0; T.jw += x.s.jw || 0; T.telat += x.s.telat; T.alpa += x.s.alpa; T.isc += x.s.izin + x.s.sakit + x.s.cuti; });
+    h += '<div class="sub">' + esc(periodLabel(true)) + ' · Sen–Sab · dari sheet Absensi Ruang Rupa (tab Absensi + Rekap jam ' + esc(D.abs.meta.suf || '') + ')</div>';
+    h += '<div class="abs-sum"><div><span class="k">Tepat waktu tim</span><b>' + pct(T.hari ? T.tepat / T.hari : null) + '</b><small>' + T.tepat + ' / ' + T.hari + ' hari</small></div>' +
+      '<div><span class="k">Jam kerja terpenuhi</span><b>' + pct(T.jw ? Math.min(1, T.ja / T.jw) : null) + '</b><small>' + nfmt(T.ja) + ' / ' + nfmt(T.jw) + ' jam</small></div>' +
+      '<div><span class="k">Terlambat</span><b>' + T.telat + '×</b><small>semua orang</small></div>' +
+      '<div><span class="k">Izin · sakit · cuti / alpa</span><b>' + T.isc + ' / ' + T.alpa + '</b><small>hari</small></div></div>';
+    h += '<div class="rtbl-wrap"><table class="rtbl abs-tbl"><thead><tr><th>Nama</th><th>Tepat waktu</th><th class="r">Terlambat</th><th class="c">Izin</th><th class="c">Sakit</th><th class="c">Cuti</th><th class="c">Alpa</th><th>Jam kerja (aktual / wajib)</th><th class="r">Kurang jam</th></tr></thead><tbody>' + st.map(function (x) {
+      var s = x.s, col = COLORS[x.p.nama] || x.p.warna, rt = s.hari ? s.tepat / s.hari : null;
+      return '<tr><td class="nm" data-l=""><a href="#/orang/' + encodeURIComponent(x.p.nama) + '"><i style="background:' + col + '"></i><b>' + esc(x.p.nama) + '</b></a>' + (D.abs.jam[x.p.nama] ? '<small>jam resmi ' + esc(D.abs.jam[x.p.nama].masuk + '–' + D.abs.jam[x.p.nama].pulang) + '</small>' : '') + '</td>' +
+        '<td data-l="Tepat waktu" class="wide"><div class="abs-v"><b>' + s.tepat + '/' + s.hari + '</b> hari <em>' + pct(rt) + '</em></div>' + pbar(rt, col) + '</td>' +
+        '<td data-l="Terlambat" class="r">' + (s.telat ? '<b>' + s.telat + '×</b><small>' + s.telatMnt + ' mnt total</small>' : '<span class="muted">0</span>') + '</td>' +
+        ['izin', 'sakit', 'cuti', 'alpa'].map(function (k) { return '<td data-l="' + k[0].toUpperCase() + k.slice(1) + '" class="c' + (k === 'alpa' && s.alpa ? ' bad' : '') + '">' + (s[k] || '<span class="muted">0</span>') + '</td>'; }).join('') +
+        '<td data-l="Jam kerja" class="wide"><div class="abs-v"><b>' + nfmt(s.ja || 0) + '</b> / ' + nfmt(s.jw || 0) + ' jam <em>' + pct(s.pct) + '</em></div>' + pbar(s.pct, col) + '</td>' +
+        '<td data-l="Kurang jam" class="r">' + (s.kurang ? s.kurang + ' hari' : '<span class="muted">0</span>') + '</td></tr>';
+    }).join('') + '</tbody></table></div>';
+    return h + '<p class="note">' + esc(absRule()) + ' KPI: Absensi tepat waktu (bobot 3) dan Jam kerja terpenuhi (bobot 3) untuk Hakim, Edu, Novri, Yudhis; di Ega keduanya masuk rincian Disiplin.</p></div>';
+  }
+  function absPerson(nama) {
+    var h = '<div class="sect-title">Absensi & jam kerja · ' + esc(periodLabel(true)) + '</div>';
+    if (!D.abs) return h + '<div class="panel"><div class="att-empty">Absensi belum disambungkan ke data asli — menunggu jam masuk resmi Novri & Yudhis ditetapkan. <a target="_top" href="' + esc(BASE) + '?demo=1">Lihat contoh</a>.</div></div>';
+    var s = absStat(nama), col = COLORS[nama] || '#154736', j = D.abs.jam[nama], rt = s.hari ? s.tepat / s.hari : null;
+    h += '<div class="abs-sum abs-sum-p"><div><span class="k">Tepat waktu</span><b>' + s.tepat + ' / ' + s.hari + '</b><small>' + pct(rt) + ' hari wajib</small></div>' +
+      '<div><span class="k">Terlambat</span><b>' + s.telat + '×</b><small>' + s.telatMnt + ' menit total</small></div>' +
+      '<div><span class="k">Jam kerja</span><b>' + nfmt(s.ja || 0) + ' / ' + nfmt(s.jw || 0) + '</b><small>' + pct(s.pct) + ' terpenuhi · kurang ' + (s.kurang || 0) + ' hari</small></div>' +
+      '<div><span class="k">Izin · sakit · cuti · alpa</span><b>' + s.izin + ' · ' + s.sakit + ' · ' + s.cuti + ' · ' + s.alpa + '</b><small>' + (j ? 'jam resmi ' + esc(j.masuk + '–' + j.pulang) : '') + '</small></div></div>';
+    if (j && j.cat) h += '<p class="note" style="margin-top:0">' + esc(j.cat) + '</p>';
+    var rk = D.abs.rekap.filter(function (r) { return r.nama === nama && (r.per === 'Bulan' || +(r.per.split(' ')[1]) <= D.meta.nw); });
+    h += '<div class="abs-two"><div><div class="sub abs-cap">Rekap per minggu</div><div class="rtbl-wrap"><table class="rtbl"><thead><tr><th>Periode</th><th class="r">Hari wajib</th><th>Jam aktual / wajib</th><th class="r">Terlambat</th><th class="r">Kurang jam</th></tr></thead><tbody>' + rk.map(function (r) {
+      var on = r.per === absPer();
+      return '<tr class="' + (on ? 'on' : '') + (r.per === 'Bulan' ? ' tot' : '') + '"><td class="nm" data-l=""><b>' + esc(r.per) + '</b><small>' + ddmm(r.mulai) + '–' + ddmm(r.selesai) + '</small></td><td data-l="Hari wajib" class="r">' + (r.hari == null ? '—' : r.hari) + '</td>' +
+        '<td data-l="Jam kerja" class="wide">' + (r.hari ? '<div class="abs-v"><b>' + nfmt(r.ja) + '</b> / ' + nfmt(r.jw) + ' <em>' + pct(r.pct) + '</em></div>' + pbar(r.pct, col) : '<span class="muted">belum berjalan</span>') + '</td>' +
+        '<td data-l="Terlambat" class="r">' + (r.hari ? r.telat + '×' : '—') + '</td><td data-l="Kurang jam" class="r">' + (r.hari ? r.kurang + ' hari' : '—') + '</td></tr>';
+    }).join('') + '</tbody></table></div></div>';
+    var rows = s.rows.slice().sort(function (a, b) { return a.date < b.date ? 1 : -1; });
+    var HR = ['Min', 'Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab'];
+    h += '<div><div class="sub abs-cap">Harian · ' + esc(periodLabel(true)) + '</div>' + (rows.length ? '<div class="rtbl-wrap"><table class="rtbl abs-days"><thead><tr><th>Tanggal</th><th>Masuk</th><th>Pulang</th><th>Status</th><th>Wajib pulang</th><th class="r">Jam kerja</th><th>Cukup?</th></tr></thead><tbody>' + rows.map(function (r) {
+      var d = new Date(r.date + 'T00:00:00');
+      return '<tr><td class="nm" data-l=""><b>' + HR[d.getDay()] + ' ' + ddmm(r.date) + '</b></td><td data-l="Masuk" class="mono">' + esc(r.masuk || '—') + '</td><td data-l="Pulang" class="mono">' + esc(r.pulang || '—') + '</td><td data-l="Status">' + absTag(r) + '</td><td data-l="Wajib pulang" class="mono">' + esc(r.wajib || '—') + '</td><td data-l="Jam kerja" class="r mono">' + esc(r.jam || '—') + '</td><td data-l="Cukup?">' + cukupTag(r.cukup) + '</td></tr>';
+    }).join('') + '</tbody></table></div>' : '<div class="panel"><div class="att-empty">Belum ada hari kerja yang lewat di periode ini.</div></div>') + '</div></div>';
+    return h + '<p class="note">' + esc(absRule()) + '</p>';
+  }
   function nfmt(x) { return (Math.round(x * 100) / 100).toString().replace('.', ','); }
   function kpiOf(n, k) { return D.kpi.filter(function (x) { return x.nama === n && x.kpi === k; })[0]; }
   function sumBobot(n) { return D.kpi.filter(function (x) { return x.nama === n && x.bobot > 0; }).reduce(function (a, x) { return a + x.bobot; }, 0); }
@@ -257,12 +349,12 @@
       return '<div class="poin-card"><div class="pc-h"><i style="background:' + (COLORS[p.nama] || p.warna) + '"></i><b>' + esc(p.nama) + '</b><span>Σ ' + sb + ' poin' + (sb !== 100 ? ' · dinormalkan ke 100' : '') + '</span></div><ul>' +
         ks.map(function (k) {
           var sub = p.nama === 'Ega' && EGA_SUB[k.kpi] ? '<small>' + esc(EGA_SUB[k.kpi].join(' · ')) + '</small>' : '';
-          var noJam = !mapped[p.nama + '|' + k.kpi];
-          return '<li class="' + (noJam ? 'nojam' : '') + '"><span class="pk">' + esc(k.kpi) + sub + (noJam ? '<em>belum ada estimasi jam</em>' : '') + '</span><span class="pv2"><b>' + k.bobot + '</b> poin<small>' + (sb ? (k.bobot / sb * 100).toFixed(1).replace('.', ',') + '% skor' : '') + '</small></span></li>';
+          var isAbs = ABS_K.indexOf(k.kpi) >= 0, noJam = !isAbs && !mapped[p.nama + '|' + k.kpi];
+          return '<li class="' + (noJam ? 'nojam' : '') + (isAbs ? ' abs-k' : '') + '"><span class="pk">' + esc(k.kpi) + sub + (noJam ? '<em>belum ada estimasi jam</em>' : '') + (isAbs ? '<em class="kh">kehadiran · dari sheet Absensi</em>' : '') + '</span><span class="pv2"><b>' + k.bobot + '</b> poin<small>' + (sb ? (k.bobot / sb * 100).toFixed(1).replace('.', ',') + '% skor' : '') + '</small></span></li>';
         }).join('') + '</ul></div>';
     }).join('') + '</div>';
     var y = sumBobot('Yudhis');
-    return h + '<p class="note">Poin = bobot penilaian KPI, dibaca langsung dari ⚙️ Pengaturan (tab 🌐 Web), jadi ikut berubah kalau Mas mengubah bobot. Skor = Σ(poin × capaian, maks 100% per KPI) ÷ Σ poin KPI yang sudah ada datanya × 100.' + (y && y !== 100 ? ' Σ poin Yudhis = ' + y + ' (ditambah Brief Ruang Rupa 15), jadi dinormalkan: 1 poin Yudhis = ' + (100 / y).toFixed(2).replace('.', ',') + ' dari skor 100.' : '') + ' Rincian Ega (konten AI Kesatrian, rekap realtime, laporan Sabtu / optimasi & omset, kesehatan toko, iklan Shopee) tidak punya poin sendiri; nilainya digabung ke Disiplin dan Hasil.</p>';
+    return h + '<p class="note">Poin = bobot penilaian KPI, dibaca langsung dari ⚙️ Pengaturan (tab 🌐 Web), jadi ikut berubah kalau Mas mengubah bobot. Skor = Σ(poin × capaian, maks 100% per KPI) ÷ Σ poin KPI yang sudah ada datanya × 100.' + (y && y !== 100 ? ' Σ poin Yudhis = ' + y + ' (ditambah Brief Ruang Rupa 15), jadi dinormalkan: 1 poin Yudhis = ' + (100 / y).toFixed(2).replace('.', ',') + ' dari skor 100.' : '') + ' Absensi tepat waktu dan Jam kerja terpenuhi (3 + 3 poin) = KPI kehadiran, berlaku untuk semua orang; di Ega masuk Disiplin (24 to-do + 3 + 3). Rincian Ega (konten AI Kesatrian, rekap realtime, laporan Sabtu, absensi, jam kerja / optimasi & omset, kesehatan toko, iklan Shopee) tidak punya poin sendiri; nilainya digabung ke Disiplin dan Hasil.</p>';
   }
   function bobotDetail() {
     var rows = JENIS.map(function (j) { return { j: j, t: jenisJam(j) }; }).sort(function (a, b) { return b.t - a.t; });
@@ -281,7 +373,7 @@
         '<div class="bs"><div class="pbar"><span style="width:' + (r.t / mx * 100).toFixed(1) + '%;background:' + (extra ? '#a67c3d' : '#154736') + '"></span></div><em>' + (extra ? '+' : '') + (r.t / base * 100).toFixed(1).replace('.', ',') + '%</em></div></li>';
     };
     var mapped = {}; Object.keys(KPI_MAP).forEach(function (w) { KPI_MAP[w].forEach(function (m) { mapped[m[0] + '|' + m[1]] = 1; }); });
-    var tanpaJam = {}; D.kpi.forEach(function (k) { if (k.bobot > 0 && !mapped[k.nama + '|' + k.kpi]) (tanpaJam[k.kpi] = tanpaJam[k.kpi] || []).push(k.nama + ' ' + k.bobot); });
+    var tanpaJam = {}; D.kpi.forEach(function (k) { if (k.bobot > 0 && !mapped[k.nama + '|' + k.kpi] && ABS_K.indexOf(k.kpi) < 0) (tanpaJam[k.kpi] = tanpaJam[k.kpi] || []).push(k.nama + ' ' + k.bobot); });
     var jamBody = '<div class="bd-head"><span>Jenis pekerjaan</span><span>Per item</span><span>Volume/mgg</span><span>Jam/mgg</span><span>Poin KPI</span><span>Porsi jam</span></div>' +
       '<ul class="bd">' + rows.map(function (r) { return line(r, tot); }).join('') + '</ul>' +
       '<div class="bd-sub">Tambahan akun Ruang Rupa mulai Des 2026 (turunan, belum masuk total di atas): +' + nfmt(rrTot) + ' jam/minggu</div>' +
@@ -325,6 +417,7 @@
       (att.length ? '<ul class="att">' + att.map(function (a) { return '<li class="' + (a.c >= 0.5 ? 'mid' : '') + '"><div class="pct">' + pct(a.c) + '</div><div class="who-k"><b>' + esc(a.k.nama + ' · ' + a.k.kpi) + '</b><span>' + esc(a.why) + '</span></div><div class="bobot">Bobot ' + a.k.bobot + '</div></li>'; }).join('') + '</ul>'
         : '<div class="att-empty">' + (have.length ? 'Tidak ada KPI di bawah 75% pada periode ini.' : 'Belum ada KPI yang jatuh tempo pada periode ini — daftar muncul otomatis setelah ada data.') + '</div>') + '</div></section>';
     h += '<section class="lower lower2">' + progressPanel(ps) + jamPanel(ps) + '</section>';
+    h += '<section class="abs-sec">' + absPanel(ps) + '</section>';
     h += footer();
     return h;
   }
@@ -361,9 +454,10 @@
     rows += '<tr class="tot"><td>Total</td><td class="c">' + tb + '</td><td colspan="4">Σ bobot × capaian ÷ Σ bobot KPI yang sudah ada datanya (maks 100% per KPI) · data ' + Math.round((covOf(p) || 0) * 100) + '% bobot</td><td class="r">' + f1(s) + '</td><td class="c"><span class="g ' + g.c + '">' + g.t + '</span></td></tr>';
     h += '<div class="tbl-wrap"><table class="kpi-table"><thead><tr><th>KPI</th><th class="c">Bobot</th><th>Target</th><th>Capaian</th><th class="r">Capaian %</th><th></th><th class="r">Skor</th><th class="c">Status</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
     if (nama === 'Ega') {
-      h += '<p class="note">Skor Ega = Disiplin (bobot ' + bob('Ega', 'Disiplin') + ') + Hasil (bobot ' + bob('Ega', 'Hasil') + '); bobot bisa diubah Mas di ⚙️ Pengaturan. Disiplin = rata-rata gabungan konten AI Kesatrian, rekap realtime Sen–Sab, dan laporan mingguan selesai tepat Sabtu (Status Selesai). Hasil = rata-rata Aktual ÷ Target 3 toko × 3 jenis, maks 100% per baris. ROAS (Iklan Shopee): 100% di dalam rentang ROAS min–ROAS maks; di bawah = Aktual ÷ ROAS min; di atas = ROAS maks ÷ Aktual. Mode ROAS saat ini: <b>' + esc(D.meta.roas || '—') + '</b>.</p>';
+      h += '<p class="note">Skor Ega = Disiplin (bobot ' + bob('Ega', 'Disiplin') + ') + Hasil (bobot ' + bob('Ega', 'Hasil') + '); bobot bisa diubah Mas di ⚙️ Pengaturan. Disiplin = to-do (24: konten AI Kesatrian, rekap realtime Sen–Sab, laporan mingguan selesai tepat Sabtu) + absensi tepat waktu (3) + jam kerja terpenuhi (3). Hasil = rata-rata Aktual ÷ Target 3 toko × 3 jenis, maks 100% per baris. ROAS (Iklan Shopee): 100% di dalam rentang ROAS min–ROAS maks; di bawah = Aktual ÷ ROAS min; di atas = ROAS maks ÷ Aktual. Mode ROAS saat ini: <b>' + esc(D.meta.roas || '—') + '</b>.</p>';
       h += moneyTable();
     }
+    h += absPerson(nama);
     var two = '';
     if (nama === 'Hakim') two += uploadTable(function (c) { return c.akun !== 'Ruang Rupa'; }, 'Cek upload terakhir', 'Kalender konten × Log upload IG · 12 jadwal terakhir yang sudah lewat') + adsTable();
     else if (nama === 'Yudhis') two += uploadTable(function (c) { return c.akun === 'Ruang Rupa'; }, 'Upload Ruang Rupa (IG + TikTok)', 'Jadwal Sen/Rab/Jum dari kalender · reels Edu, upload Yudhis · sumber: KPI Yudhis · Log upload (beres jika IG dan TikTok sama-sama tayang < 12.00)');
@@ -495,8 +589,56 @@
   })(0);
 
   /* ---------- demo data (fiktif) ---------- */
+  /* absensi contoh: Des 2026 Sen–Sab, dihitung dengan aturan sheet (toleransi 10 mnt, wajib pulang = maks(17:00, masuk + 8 jam)) */
+  function absDemo() {
+    var seed = 7; var rnd = function () { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; };
+    var pad = function (n) { return ('0' + n).slice(-2); }, tm = function (m) { return pad(Math.floor(m / 60)) + ':' + pad(m % 60); };
+    var cut = '2026-12-25', w1 = new Date('2026-11-30T00:00:00');
+    // profil: peluang telat, rata-rata menit telat, peluang pulang kurang, hari khusus
+    var PF = { Hakim: [0.08, 14, 0.05, { '2026-12-11': 'Izin' }], Edu: [0.3, 22, 0.04, { '2026-12-18': 'Sakit' }], Novri: [0.12, 15, 0.15, {}], Yudhis: [0.18, 18, 0.12, { '2026-12-08': 'Alpa', '2026-12-22': 'Izin' }], Ega: [0.04, 11, 0.03, { '2026-12-15': 'Cuti' }] };
+    var rows = [], wk = {};
+    ORDER.forEach(function (n) { wk[n] = {}; });
+    for (var d = 1; d <= 31; d++) {
+      var dt = new Date(2026, 11, d); if (dt.getDay() === 0) continue;
+      var iso = '2026-12-' + pad(d), w = Math.floor((dt - w1) / 864e5 / 7) + 1;
+      ORDER.forEach(function (n) {
+        var f = PF[n], ket = f[3][iso] || 'Hadir', row = ['abs', iso, n, '', '', ket, '—', '', '', '—'];
+        var W = wk[n][w] || (wk[n][w] = { hari: 0, tepat: 0, telat: 0, ja: 0, kurang: 0 });
+        if (iso > cut) { rows.push(row); return; }
+        if (ket === 'Izin' || ket === 'Sakit' || ket === 'Cuti') { row[6] = ket; rows.push(row); return; }
+        W.hari++;
+        if (ket === 'Alpa') { row[6] = 'Alpa'; row[9] = 'Kurang 8j'; W.kurang++; rows.push(row); return; }
+        var late = rnd() < f[0], m = late ? 540 + 10 + Math.floor(rnd() * f[1] * 1.6) : 540 - 12 + Math.floor(rnd() * 21);
+        var wajib = Math.max(1020, m + 480), short = rnd() < f[2], pl = short ? wajib - 5 - Math.floor(rnd() * 40) : wajib + Math.floor(rnd() * 45);
+        var tl = m - 540, jk = pl - m;
+        row[3] = tm(m); row[4] = tm(pl); row[6] = tl >= 10 ? 'Terlambat ' + tl + 'm' : 'Tepat waktu'; row[7] = tm(wajib); row[8] = Math.floor(jk / 60) + ':' + pad(jk % 60);
+        row[9] = pl >= wajib ? 'Cukup' : 'Kurang ' + (wajib - pl) + 'm';
+        if (tl >= 10) W.telat++; else W.tepat++;
+        if (pl < wajib) W.kurang++;
+        W.ja += jk / 60; rows.push(row);
+      });
+    }
+    var out = [['abs_meta', 'Des 26', '2026-12-01', '2026-11-30', '5', cut, '8', '10']];
+    ORDER.forEach(function (n) { out.push(['jamresmi', n, '09:00', '17:00', n === 'Novri' ? 'Usulan: masuk 11.00 (menunggu persetujuan)' : n === 'Yudhis' ? 'Usulan: masuk 07.00 (menunggu persetujuan)' : '']); });
+    var kw = {};
+    ORDER.forEach(function (n) {
+      var tot = { hari: 0, tepat: 0, telat: 0, ja: 0, kurang: 0 }; kw[n] = { abs: [], jam: [] };
+      for (var w = 1; w <= 6; w++) {
+        var a = new Date(w1.getTime() + (w - 1) * 7 * 864e5), b = new Date(a.getTime() + 5 * 864e5), f = function (x) { return x.getFullYear() + '-' + pad(x.getMonth() + 1) + '-' + pad(x.getDate()); };
+        if (w === 6) { out.push(['rekap', n, 'Minggu 6', f(a), f(b), '', '', '', '', '', '', '']); continue; }
+        var W = wk[n][w] || { hari: 0, tepat: 0, telat: 0, ja: 0, kurang: 0 }, jw = W.hari * 8, pc = jw ? Math.min(1, W.ja / jw) : null;
+        ['hari', 'tepat', 'telat', 'ja', 'kurang'].forEach(function (k) { tot[k] += W[k]; });
+        out.push(['rekap', n, 'Minggu ' + w, f(a), f(b), String(W.hari), jw.toFixed(2), W.ja.toFixed(2), (W.ja - jw).toFixed(2), pc == null ? '' : pc.toFixed(4), String(W.telat), String(W.kurang)]);
+        if (w <= 4) { kw[n].abs.push(W.hari ? W.tepat / W.hari : null); kw[n].jam.push(pc); }
+      }
+      var tjw = tot.hari * 8;
+      out.push(['rekap', n, 'Bulan', '2026-12-01', '2026-12-31', String(tot.hari), tjw.toFixed(2), tot.ja.toFixed(2), (tot.ja - tjw).toFixed(2), tjw ? Math.min(1, tot.ja / tjw).toFixed(4) : '', String(tot.telat), String(tot.kurang)]);
+    });
+    return { rows: out.concat(rows), kw: kw };
+  }
   function demoRows() {
     var r = [['tipe']];
+    var AD = absDemo();
     r.push(['meta', 'Desember 2026', '2026-12-01', '4', '5', '2026-12-26 08:00', '2026-12-01', '2026-11-30', '2026-12-26', '1 Des–6 Des', '7 Des–13 Des', '14 Des–20 Des', '21 Des–27 Des', '28 Des–31 Des', '', '4', '2026-12-31', 'Rentang (Target s.d. Target maks)']);
     var P = { Hakim: 'Sosmed spesialis', Edu: 'Kreator video', Novri: 'Kreator desain', Yudhis: 'Kreator desain', Ega: 'Marketplace & produk' };
     var K = [
@@ -525,7 +667,7 @@
       ['Yudhis', 'Live Shopee (tim)', 6, 'Rolling, live 4 jam mulai 18.00', 1, [.5, .5, .5, .5]],
       ['Yudhis', 'Brief tepat waktu', 15, 'Brief Ruang Rupa H-2 sebelum tayang', 1, [1, 1, .67, .67]],
       ['Yudhis', 'Meeting tim', 4, 'Hadir + ≥ 1 gagasan/evaluasi', 1, [0, 1, 1, 0]],
-      ['Ega', 'Disiplin', 30, 'To-do selesai: konten AI Kesatrian, rekap harian Sen–Sab, laporan mingguan selesai Sabtu', 1, [.9, .93, .95, .94]],
+      ['Ega', 'Disiplin', 30, 'To-do selesai: konten AI Kesatrian, rekap harian Sen–Sab, laporan mingguan selesai Sabtu (24), plus absensi tepat waktu (3) dan jam kerja terpenuhi (3)', 1, [.9, .93, .95, .94]],
       ['Ega', 'Hasil', 70, 'Rata-rata capaian 3 toko × 3 jenis', 1, [.84, .86, .89, .88]],
       ['Ega', 'Konten AI Kesatrian', 0, 'Rincian Disiplin · 18 konten/minggu', .95, [.89, .94, .94, .94]],
       ['Ega', 'Rekap realtime', 0, 'Rincian Disiplin · catatan tiap Sen–Sab', 1, [1, 1, 1, 1]],
@@ -534,10 +676,18 @@
       ['Ega', 'Kesehatan toko', 0, 'Rincian Hasil · skor kesehatan vs target', 1, [.95, .95, .96, .96]],
       ['Ega', 'Iklan Shopee', 0, 'Rincian Hasil · ROAS dalam rentang', 1, [.75, .78, .81, .8]]
     ];
+    ['Hakim', 'Edu', 'Novri', 'Yudhis', 'Ega'].forEach(function (n) {
+      var e = n === 'Ega', r4 = function (a) { return a.map(function (v) { return Math.round((v == null ? 0 : v) * 10000) / 10000; }); };
+      K.push([n, ABS_K[0], e ? 0 : 3, (e ? 'Rincian Disiplin · ' : '') + 'Hadir tepat jam masuk (Sen–Sab); izin/sakit/cuti tidak dihitung, alpa = 0', 1, r4(AD.kw[n].abs)]);
+      K.push([n, ABS_K[1], e ? 0 : 3, (e ? 'Rincian Disiplin · ' : '') + 'Jam aktual ÷ jam wajib (hari wajib × 8 jam, Sen–Sab); lembur menutup kurang dalam periode yang sama; maks 100%', 1, r4(AD.kw[n].jam)]);
+    });
     // Ega Disiplin/Hasil = gabungan rincian (pembagi sama → rata-rata); skor orang = Σ(bobot × min(capaian;1)) ÷ Σbobot × 100 — sama dengan rumus sheet
     var mean = function (a) { return a.reduce(function (x, y) { return x + y; }, 0) / a.length; };
     var kc = function (n, kp) { return K.filter(function (k) { return k[0] === n && k[1] === kp; })[0][5]; };
-    K.forEach(function (k) { if (k[0] === 'Ega' && EGA_SUB[k[1]]) k[5] = [0, 1, 2, 3].map(function (i) { return Math.round(mean(EGA_SUB[k[1]].map(function (s) { return kc('Ega', s)[i]; })) * 10000) / 10000; }); });
+    K.forEach(function (k) { if (k[0] === 'Ega' && EGA_SUB[k[1]]) k[5] = [0, 1, 2, 3].map(function (i) {
+      var subs = EGA_SUB[k[1]].filter(function (s) { return ABS_K.indexOf(s) < 0; }), v = mean(subs.map(function (s) { return kc('Ega', s)[i]; }));
+      if (k[1] === 'Disiplin') v = (24 * v + 3 * Math.min(1, kc('Ega', ABS_K[0])[i]) + 3 * Math.min(1, kc('Ega', ABS_K[1])[i])) / 30; // Disiplin 30 = 24 to-do + 3 absensi + 3 jam kerja
+      return Math.round(v * 10000) / 10000; }); });
     var team = [0, 0, 0, 0];
     ORDER.forEach(function (n) {
       var ks = K.filter(function (k) { return k[0] === n && k[2] > 0; }), sb = ks.reduce(function (a, k) { return a + k[2]; }, 0);
@@ -551,6 +701,7 @@
     // items so capaian text is consistent with the % above
     K.forEach(function (k) {
       if (k[0] === 'Ega' && (k[1] === 'Disiplin' || k[1] === 'Hasil')) return;
+      if (ABS_K.indexOf(k[1]) >= 0) return; // capaian absensi dibaca dari baris abs/rekap
       k[5].forEach(function (c, i) { var d = 10; r.push(['item', k[0], k[1], ['2026-12-02', '2026-12-09', '2026-12-16', '2026-12-23'][i], String(i + 1), (c * d).toFixed(2), String(d), 'Data contoh · minggu ' + (i + 1), 'Data contoh']); });
     });
     [['King Pandanus', [4.1e6, 4.6e6, 5.1e6, 4.9e6], [1.2e6, 1.3e6, 1.25e6, 1.1e6]], ['Intenskin', [2.1e5, 2.4e5, 4.8e5, 3.5e5], [1.1e5, 8e4, 2.2e5, 9e4]], ['Kesatrian', [1.0e6, 4.7e5, 2.8e5, 6.1e5], [9.4e4, 6.1e5, 3.2e5, 2.8e5]]].forEach(function (t) {
@@ -565,6 +716,6 @@
     [[21, 'Sen', 'IG 21/12 10:05 · TikTok 21/12 10:20', 'Tepat waktu', ''], [23, 'Rab', 'IG 23/12 09:50 · TikTok 23/12 12:40', 'Terlambat', 'Yudhis'], [25, 'Jum', 'IG 25/12 10:10 · TikTok 25/12 10:12', 'Tepat waktu', '']].forEach(function (c) { r.push(['cek', '2026-12-' + c[0], c[1], '4', 'Ruang Rupa', 'Video', 'Done', 'Edu', c[2], c[3], c[4]]); });
     [['Hakim', 236, 332], ['Edu', 43, 55], ['Novri', 121, 157], ['Yudhis', 78, 106], ['Ega', 117, 153]].forEach(function (t) { r.push(['todo', t[0], String(t[1]), String(t[2])]); });
     r.push(['todo_meta', 'Sabtu, 26 Desember 2026']);
-    return r;
+    return r.concat(AD.rows);
   }
 })();
